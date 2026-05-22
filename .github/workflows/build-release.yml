@@ -1,0 +1,220 @@
+name: Build & Release Infra Offline Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布标签，例如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
+      docker_version:
+        description: 'Docker 版本，例如 27.3.1'
+        required: true
+        default: '27.3.1'
+      compose_version:
+        description: 'Docker Compose 版本，例如 2.32.0'
+        required: true
+        default: '2.32.0'
+
+# -------------------------------------------------------
+# 全局变量：tag 推送时从 GITHUB_REF_NAME 取版本
+# -------------------------------------------------------
+env:
+  DEFAULT_DOCKER_VERSION: '27.3.1'
+  DEFAULT_COMPOSE_VERSION: '2.32.0'
+
+jobs:
+  # =====================================================
+  # 构建各架构离线安装包
+  # =====================================================
+  build:
+    name: Build [${{ matrix.arch }}]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            docker_arch: x86_64
+            compose_arch: x86_64
+          - arch: arm64
+            docker_arch: aarch64
+            compose_arch: aarch64
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      # ── 确定版本和标签 ─────────────────────────────────
+      - name: 解析版本信息
+        id: versions
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "docker_ver=${{ env.DEFAULT_DOCKER_VERSION }}" >> "$GITHUB_OUTPUT"
+            echo "compose_ver=${{ env.DEFAULT_COMPOSE_VERSION }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+            echo "docker_ver=${{ github.event.inputs.docker_version }}" >> "$GITHUB_OUTPUT"
+            echo "compose_ver=${{ github.event.inputs.compose_version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 下载 Docker 静态二进制包 ────────────────────────
+      - name: 下载 Docker 静态二进制 (${{ matrix.arch }})
+        env:
+          DOCKER_VER: ${{ steps.versions.outputs.docker_ver }}
+          DOCKER_ARCH: ${{ matrix.docker_arch }}
+        run: |
+          mkdir -p packages/docker
+          URL="https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VER}.tgz"
+          echo "::notice::下载 Docker ${DOCKER_VER} [${DOCKER_ARCH}]: ${URL}"
+          curl -fSL --retry 3 --retry-delay 5 "${URL}" \
+            -o "packages/docker/docker-${DOCKER_VER}.tgz"
+          echo "下载完成，文件大小: $(du -sh packages/docker/docker-${DOCKER_VER}.tgz | cut -f1)"
+
+      # ── 下载 Docker Compose 二进制 ──────────────────────
+      - name: 下载 Docker Compose (${{ matrix.arch }})
+        env:
+          COMPOSE_VER: ${{ steps.versions.outputs.compose_ver }}
+          COMPOSE_ARCH: ${{ matrix.compose_arch }}
+        run: |
+          URL="https://github.com/docker/compose/releases/download/v${COMPOSE_VER}/docker-compose-linux-${COMPOSE_ARCH}"
+          echo "::notice::下载 Docker Compose ${COMPOSE_VER} [${COMPOSE_ARCH}]: ${URL}"
+          curl -fSL --retry 3 --retry-delay 5 "${URL}" \
+            -o "packages/docker/docker-compose"
+          chmod +x packages/docker/docker-compose
+          echo "下载完成，文件大小: $(du -sh packages/docker/docker-compose | cut -f1)"
+
+      # ── 打包 ────────────────────────────────────────────
+      - name: 打包离线安装包
+        id: package
+        env:
+          TAG: ${{ steps.versions.outputs.tag }}
+          DOCKER_VER: ${{ steps.versions.outputs.docker_ver }}
+          COMPOSE_VER: ${{ steps.versions.outputs.compose_ver }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          PKG_NAME="infratools-${TAG}-${ARCH}"
+          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "${PKG_NAME}/packages/docker"
+
+          # 复制离线安装包
+          cp packages/docker/docker-${DOCKER_VER}.tgz "${PKG_NAME}/packages/docker/"
+          cp packages/docker/docker-compose           "${PKG_NAME}/packages/docker/"
+
+          # 复制安装脚本
+          cp install.sh         "${PKG_NAME}/"
+          cp -r docker/         "${PKG_NAME}/"
+          cp README.md          "${PKG_NAME}/"
+
+          # 生成版本信息文件
+          cat > "${PKG_NAME}/versions.env" <<EOF
+          DOCKER_VERSION=${DOCKER_VER}
+          COMPOSE_VERSION=${COMPOSE_VER}
+          PACKAGE_ARCH=${ARCH}
+          PACKAGE_TAG=${TAG}
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          EOF
+
+          chmod +x "${PKG_NAME}/install.sh" "${PKG_NAME}/docker/install.sh"
+
+          tar -czf "${PKG_NAME}.tar.gz" "${PKG_NAME}/"
+          echo "打包完成: ${PKG_NAME}.tar.gz ($(du -sh ${PKG_NAME}.tar.gz | cut -f1))"
+
+      # ── 上传构建产物 ────────────────────────────────────
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.pkg_name }}
+          path: ${{ steps.package.outputs.pkg_name }}.tar.gz
+          retention-days: 1
+
+  # =====================================================
+  # 汇总并创建 GitHub Release
+  # =====================================================
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 解析版本信息
+        id: versions
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "docker_ver=${{ env.DEFAULT_DOCKER_VERSION }}" >> "$GITHUB_OUTPUT"
+            echo "compose_ver=${{ env.DEFAULT_COMPOSE_VERSION }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+            echo "docker_ver=${{ github.event.inputs.docker_version }}" >> "$GITHUB_OUTPUT"
+            echo "compose_ver=${{ github.event.inputs.compose_version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: 生成 SHA256 校验文件
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.versions.outputs.tag }}
+          name: "Infratools ${{ steps.versions.outputs.tag }}"
+          body: |
+            ## Infratools ${{ steps.versions.outputs.tag }}
+
+            Linux 基础设施离线安装包，支持在无网络环境下快速部署。
+
+            ### 📦 包含组件
+
+            | 组件 | 版本 |
+            |------|------|
+            | Docker | `${{ steps.versions.outputs.docker_ver }}` |
+            | Docker Compose | `${{ steps.versions.outputs.compose_ver }}` |
+
+            ### 🏗️ 支持架构
+
+            | 文件 | 架构 |
+            |------|------|
+            | `infratools-${{ steps.versions.outputs.tag }}-amd64.tar.gz` | x86_64 (amd64) |
+            | `infratools-${{ steps.versions.outputs.tag }}-arm64.tar.gz` | aarch64 (arm64) |
+
+            ### 🚀 离线安装方式
+
+            ```bash
+            # 1. 下载对应架构的安装包（以 amd64 为例）
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.versions.outputs.tag }}/infratools-${{ steps.versions.outputs.tag }}-amd64.tar.gz
+
+            # 2. 验证文件完整性（可选）
+            sha256sum -c SHA256SUMS.txt
+
+            # 3. 解压并安装
+            tar -xzf infratools-${{ steps.versions.outputs.tag }}-amd64.tar.gz
+            cd infratools-${{ steps.versions.outputs.tag }}-amd64
+            sudo bash install.sh
+            ```
+
+            > 安装脚本会自动检测已安装的组件，已安装的组件将跳过，无需担心重复安装。
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          make_latest: true
